@@ -88,6 +88,79 @@ function copyReference(){copyText(current().code);}
 function copyForChat(){const d=current(),kind=curKind(),r=currentResponse();let out=`请严格批改我的Fortran笔试${kind==='comment'?'程序解释':'手写编程'}题（满分10分）。\n原题来自报告${d.rep} 第${d.no}题：${toText(d.q)}\n`;
 if(kind==='comment'){out+='原程序：\n'+d.code+'\n我的逐行解释：\n'+d.quiz.filter(q=>q.ask).map(q=>`${q.no}. ${q.raw}\n注释：${(r.notes||{})[q.no]||'(未填写)'}`).join('\n')+'\n我的输出结果：'+(r.answer||'(未填写)');}else{out+='我的程序：\n'+(r.answer||'(未填写)');}out+='\n请检查变量声明、语法、计算逻辑、题意完成度，给出评分与简洁改正方案。';copyText(out);}
 function exportProgress(){const blob=new Blob([JSON.stringify({exportTime:new Date().toISOString(),version:2,data:state},null,2)],{type:'application/json;charset=utf-8'});let url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='fortran_复习记录.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),500);toast('已导出本地复习记录');}
+/* ==================== 自动判分补丁 ==================== */
+function lineHit(q,ans){
+  const norm=s=>String(s||'').toLowerCase().replace(/[\s\p{P}]/gu,'');
+  const t=norm(ans);
+  const hits=(q.kw||[]).filter(k=>t.includes(norm(k)));
+  return {has:!!String(ans||'').trim(),ok:hits.length>=(q.need||1),hits:hits};
+}
+function autoScoreComment(d,r){
+  const asked=d.quiz.filter(q=>q.ask);
+  let wok=0,wsum=0;const detail=[];
+  asked.forEach(q=>{
+    const w=q.key?2:1;const h=lineHit(q,(r.notes||{})[q.no]);
+    wsum+=w; if(h.ok) wok+=w;
+    detail.push({no:q.no,raw:q.raw,key:!!q.key,ok:h.ok,has:h.has,hits:h.hits,ref:q.ref});
+  });
+  return {score:wsum?Math.round(10*wok/wsum):0,detail:detail,wsum:wsum,wok:wok};
+}
+function autoScoreCode(d,ans){
+  const norm=s=>String(s||'').split('\n').map(l=>l.split('!')[0].toLowerCase().replace(/\s+/g,' ').trim()).filter(Boolean).join('\n');
+  const A=norm(ans),R=norm(d.code);
+  const feats=[
+    [/^program\b/m,'PROGRAM 开头'],[/^end\s*$/m,'END 结束'],
+    [/implicit none/,'IMPLICIT NONE'],
+    [/\bdo\b/,'DO 循环'],[/end do/,'END DO 配对'],
+    [/\bif\s*\(/,'IF 判断'],[/end if/,'END IF 配对'],
+    [/\bsubroutine\b/,'SUBROUTINE 定义'],[/\bfunction\b/,'FUNCTION 定义'],[/\bcall\b/,'CALL 调用'],
+    [/open\s*\(/,'OPEN 文件'],[/write\s*\(/,'WRITE 写文件'],[/close\s*\(/,'CLOSE 文件'],
+    [/\bread\b/,'READ 输入'],[/\bprint\b/,'PRINT 输出'],
+    [/\*\*/,'乘方 **'],[/\bmod\s*\(/,'MOD 取余'],[/\bsqrt\s*\(/,'SQRT'],[/\blog\s*\(/,'LOG'],[/\babs\s*\(/,'ABS']
+  ];
+  const need=feats.filter(f=>f[0].test(R));
+  const checks=need.map(f=>({name:f[1],ok:f[0].test(A)}));
+  const ok=checks.filter(c=>c.ok).length;
+  let score=need.length?Math.round(10*ok/need.length):0;
+  if(!/^end\s*$/m.test(A)) score=Math.min(score,4);
+  if(!A) score=0;
+  return {score:score,ok:ok,total:checks.length,checks:checks};
+}
+submitQ = function(){
+  const r=currentResponse(), kind=curKind(), d=current();
+  if(kind==='code'&&!r.answer.trim()){toast('先填写你的完整程序，再提交');return;}
+  if(kind==='comment'&&!r.answer.trim()&&!Object.values(r.notes||{}).some(v=>v.trim())){toast('先给至少一行添加注释');return;}
+  const sc = kind==='comment' ? autoScoreComment(d,r).score : autoScoreCode(d,r.answer).score;
+  mutateResponse(x=>{x.submitted=true;x.score=sc;});
+  if(sc<=6) markWrong(d.id,true,false);
+  save();render();toast('已自动判分 '+sc+' / 10（觉得判错可手动修正）');
+};
+reviewSingle = function(q,ans){
+  const h=lineHit(q,ans);
+  const label=!h.has?'未作答':(h.ok?'✓ 正确':'✗ 不对');
+  const cls=(h.has&&h.ok)?'hit':'miss';
+  return `<div class="self-review"><span class="quick-tag ${cls}">${label}</span>　参考：${esc(q.ref)}<span class="muted" style="display:block;margin-top:5px">命中关键词 ${h.hits.length} / 需要 ${q.need||1}${h.hits.length?'（'+h.hits.join('、')+'）':''}</span></div>`;
+};
+commentSummary = function(d,r){
+  const g=autoScoreComment(d,r);
+  const asked=d.quiz.filter(q=>q.ask);
+  const done=asked.filter(q=>(r.notes||{})[q.no]?.trim()).length;
+  const good=g.detail.filter(x=>x.ok).length;
+  return `<div class="review"><h3>注释 · 自动判分</h3><div class="feedback-grid"><span class="quick-tag hit">得分 ${g.score} / 10</span><span class="quick-tag">已填 ${done}/${asked.length} 行</span><span class="quick-tag">判对 ${good} 行</span><span class="quick-tag">重点行 ${d.nkey} 行（权重 2）</span></div><p class="tip">按每行关键词判定：重点行需命中 ≥2 个、普通行 ≥1 个，未填的行算错。同义表述可能误判，以参考解释为准。</p></div><div class="reference"><div class="between block-label"><span>原程序（便于整体核对）</span><button class="btn small ghost" onclick="copyReference()">复制参考程序</button></div><div class="codehead">Fortran · 原程序</div><pre class="codeblock"><code>${esc(d.code)}</code></pre></div>`;
+};
+reviewUI = function(d,kind,r){
+  let body;
+  if(kind==='comment'){ body=commentSummary(d,r); }
+  else{
+    const g=autoScoreCode(d,r.answer);
+    body=`<div class="review"><h3>编程 · 自动结构判分</h3><div class="feedback-grid"><span class="quick-tag hit">得分 ${g.score} / 10</span><span class="quick-tag">通过 ${g.ok}/${g.total} 项</span></div><p class="tip">按参考程序里出现过的结构逐项核对，不是语法编译器，也不判断公式是否写对——逻辑请对照下面的参考程序。</p><ul>${g.checks.map(c=>`<li>${c.ok?'✅':'❌'} ${esc(c.name)}</li>`).join('')}</ul></div><div class="review"><h3>基础检查提示</h3><ul>${quickCheck(r.answer,d).map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div><div class="reference"><div class="between block-label"><span>参考程序（源自你的原题库）</span><button class="btn small ghost" onclick="copyReference()">复制参考程序</button></div><div class="codehead">Fortran · 参考实现</div><pre class="codeblock"><code>${esc(d.code)}</code></pre></div>`;
+  }
+  body+=`<div class="review"><h3>解题要点</h3><ul>${d.pts.map(s=>`<li>${safePt(s)}</li>`).join('')}</ul></div>`;
+  const marked=state.wrong.includes(d.id);
+  body+=`<div class="gradebox"><div class="between"><div><b>自动判分：${r.score} / 10</b><div class="gradehelp">分数由本地规则自动给出，可手动修正；要严格语法与逻辑批改请用「复制到聊天框批改」。</div></div></div><div class="gradeoptions">${[10,9,8,7,6,5,4,3,2,1,0].map(x=>`<button class="btn small ${r.score===x?'active':''}" onclick="scoreQ(${x})">${x}</button>`).join('')}</div><label style="margin-top:12px;display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" onchange="markWrong('${d.id}',this.checked)" ${marked?'checked':''}> 加入错题本，之后优先复习</label></div>`;
+  return body;
+};
+/* ==================================================== */
 let onlyCore=false;render();save();
 </script>
 </body></html>
